@@ -1,6 +1,9 @@
 __pycache__/
 *.pyc
 *.db
+*.db-shm
+*.db-wal
 .scan_state.json
 .proxies.json
-.proxies.db
+stderr.txt
+stdout.txt
