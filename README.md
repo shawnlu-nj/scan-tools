@@ -99,4 +99,4 @@ python proxy_scanner.py
 
 ## License
 
-MIT
+AGPL-3.0
