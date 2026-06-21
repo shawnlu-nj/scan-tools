@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.db
+.scan_state.json
+.proxies.json
+.proxies.db
