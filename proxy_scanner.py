@@ -61,6 +61,7 @@ class ProxyDB:
     def __init__(self):
         self._lock = threading.Lock()
         self._conn = None
+        self._save_count = 0
         self._init()
 
     def _conn_(self):
@@ -107,6 +108,7 @@ class ProxyDB:
                 proxy.get("time", ""),
             ))
             self._conn_().commit()
+            self._save_count += 1
 
     def save_many(self, proxies):
         with self._lock:
@@ -127,6 +129,7 @@ class ProxyDB:
                     p.get("time", ""),
                 ))
             self._conn_().commit()
+            self._save_count += len(proxies)
 
     def load_all(self):
         with self._lock:
@@ -144,6 +147,13 @@ class ProxyDB:
             }
             for r in rows
         ]
+
+    def count_verified(self):
+        with self._lock:
+            row = self._conn_().execute(
+                "SELECT COUNT(*) FROM proxies WHERE baidu=1 OR google=1 OR auth=1"
+            ).fetchone()
+            return row[0] if row else 0
 
     def delete(self, ip, port):
         with self._lock:
@@ -205,6 +215,8 @@ class ProxyScanner:
 
         self._exclude_ranges = []
         self._exclude_count = 0
+
+        self._speed_log = []
 
         self.stats = {"scanned": 0, "found": 0, "auth": 0, "failed": 0,
                       "total": 0, "start_time": 0}
@@ -410,6 +422,8 @@ class ProxyScanner:
             if ptype in ("ok", "auth"):
                 with self._proxies_lock:
                     self._proxies.append(rec)
+                if ptype == "auth":
+                    self.db.save(rec)
                 # queue for auto-verification (only ok, not auth);
                 # auth proxies don't need further verification
                 if ptype == "ok" and self._verify_running:
@@ -536,14 +550,6 @@ class ProxyScanner:
                     if len(self._all) >= self._max_results:
                         self._all.pop(0)
                     self._all.append(p)
-        # Re-queue existing proxies for auto-verification
-        for p in proxies:
-            if p.get("ok") and not p.get("auth"):
-                try:
-                    self._verify_queue.put_nowait(
-                        (p["ip"], p["port"], dict(p)))
-                except queue.Full:
-                    pass
         # Log to scan_log
         with self._scan_log_lock:
             self._scan_log.append({
@@ -687,6 +693,7 @@ class ProxyScanner:
         self._exclude_ranges = []
         self._exclude_count = 0
         self.clear_saved_state()
+        self._speed_log.clear()
         with self._stats_lock:
             self.stats.update(scanned=0, found=0, auth=0, failed=0,
                               total=0, start_time=0)
@@ -707,6 +714,23 @@ class ProxyScanner:
     def speed(self):
         e = time.time() - self.stats["start_time"]
         return 0 if e <= 0 else self.stats["scanned"] / e
+
+    def record_speed(self):
+        now = time.time()
+        scanned = self.stats["scanned"]
+        if self._speed_log and self._speed_log[-1][1] == scanned:
+            self._speed_log[-1] = (now, scanned)
+        else:
+            self._speed_log.append((now, scanned))
+        cutoff = now - 60
+        self._speed_log = [(t, s) for t, s in self._speed_log if t >= cutoff]
+
+    def recent_speed(self, window=60):
+        if len(self._speed_log) < 2:
+            return 0
+        dt = self._speed_log[-1][0] - self._speed_log[0][0]
+        ds = self._speed_log[-1][1] - self._speed_log[0][1]
+        return ds / dt if dt > 0 else 0
 
     def new_results(self):
         with self._new_lock:
@@ -782,6 +806,8 @@ class App:
         self.exc_reserved  = tk.BooleanVar(value=True)
 
         self._build_ui()
+        self._current_tab = 0
+        self._pp_last_save_count = 0
         self._poll()
         root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -909,8 +935,12 @@ class App:
         pf = ttk.LabelFrame(m, text="Progress", padding=8)
         pf.pack(fill=tk.X, pady=(2, 2))
 
-        self.pbar = ttk.Progressbar(pf, mode="determinate")
-        self.pbar.pack(fill=tk.X)
+        pbar_frame = ttk.Frame(pf)
+        pbar_frame.pack(fill=tk.X)
+        self.pbar = ttk.Progressbar(pbar_frame, mode="determinate")
+        self.pbar.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.lbl_pct = ttk.Label(pbar_frame, text="0%", width=8)
+        self.lbl_pct.pack(side=tk.LEFT, padx=(6, 0))
 
         sf2 = ttk.Frame(pf)
         sf2.pack(fill=tk.X, pady=(3, 0))
@@ -1162,10 +1192,8 @@ class App:
         state = self._saved_state
         proxies = self._saved_proxies
 
-        thr = state.get("threads", self.threads.get())
-        to = state.get("timeout", self.timeout.get())
-        self.threads.set(thr)
-        self.timeout.set(to)
+        thr = self.threads.get()
+        to = self.timeout.get()
 
         self.sc.clear()
         self.tree.delete(*self.tree.get_children())
@@ -1206,6 +1234,9 @@ class App:
         self.btn_resume.config(state=tk.DISABLED)
         self._saved_state = None
         self._saved_proxies = []
+        pct = self.sc.progress
+        self.pbar["value"] = pct
+        self.lbl_pct.config(text=f"{pct:.1f}%" if pct else "0%")
 
         eff = state.get("total", 0) - state.get("exclude_count", 0)
         scanned = state.get("scanned", 0)
@@ -1219,6 +1250,9 @@ class App:
             if not messagebox.askyesno("Clear", "Scan running. Stop & clear?"):
                 return
             self.sc.stop()
+        elif self.sc.stats["scanned"] or self.sc.db.count():
+            if not messagebox.askyesno("Clear", "Clear all scan data and database?"):
+                return
         self.sc.clear()
         self.sc.db.clear()
         self.tree.delete(*self.tree.get_children())
@@ -1235,6 +1269,7 @@ class App:
         self.lbl_time.config(
             text="Elapsed: 00:00:00  |  Remaining: --:--:--")
         self.pbar["value"] = 0
+        self.lbl_pct.config(text="0%")
         self.btn_start.config(state=tk.NORMAL)
         self.btn_stop.config(state=tk.DISABLED)
         self.status.set("Ready")
@@ -1276,31 +1311,24 @@ class App:
     # ---- Proxy Pool actions ----
 
     def _update_pp_tree(self):
+        # save selection
+        sel = {}
+        for iid in self.pp_tree.selection():
+            v = self.pp_tree.item(iid, "values")
+            if v:
+                sel[(v[0], v[1])] = True
         self.pp_tree.delete(*self.pp_tree.get_children())
-        # load from DB (only verified proxies), newest first
-        db_proxies = [p for p in self.sc.db.load_all()
-                      if p.get("baidu") or p.get("google") or p.get("auth")]
-        # merge with in-memory (has latest verified state)
-        mem = { (p["ip"], p["port"]): p for p in self.sc.proxy_results() }
-        seen = set()
-        rows = []
-        for p in db_proxies:
-            key = (p["ip"], p["port"])
-            seen.add(key)
-            src = mem.get(key, p)
-            rows.append(src)
-        # add any in-memory verified proxies not yet in DB
-        for key, p in mem.items():
-            if key not in seen and (p.get("baidu") or p.get("google") or p.get("auth")):
-                rows.append(p)
-        # sort newest first by time/tested
-        rows.sort(key=lambda r: r.get("tested") or r.get("time") or "", reverse=True)
+        rows = list(self.sc.db.load_all())
+        rows.sort(key=lambda r: r.get("tested") or r.get("discovered") or "", reverse=True)
         for r in rows:
             self._insert_pp_row(r)
+        # restore selection
+        for child in self.pp_tree.get_children():
+            v = self.pp_tree.item(child, "values")
+            if v and (v[0], v[1]) in sel:
+                self.pp_tree.selection_add(child)
 
     def _insert_pp_row(self, p):
-        if not (p.get("baidu") or p.get("google") or p.get("auth")):
-            return
         tag, st = self._status_and_tag(p)
         conn = p.get("conn_ms", 0)
         google = "Pass" if p.get("google") else "Fail"
@@ -1312,7 +1340,6 @@ class App:
                             tags=(tag,))
 
     def _verify_single(self, proxy):
-        """Test a single proxy against Baidu and Google."""
         ip, port = proxy["ip"], proxy["port"]
         to = self.vtimeout.get()
         result = self.sc.verify_proxy(ip, port, to)
@@ -1334,8 +1361,7 @@ class App:
             "tested": datetime.now().strftime("%H:%M:%S"),
         }
         self.sc.update_proxy(ip, port, updates)
-        if baidu or google:
-            self.sc.db.save({**proxy, **updates})
+        self.sc.db.save({**proxy, **updates})
         return updates
 
     def _verify_tree_items(self, items):
@@ -1388,6 +1414,9 @@ class App:
         sel = self.pp_tree.selection()
         if not sel:
             return
+        if not messagebox.askyesno("Remove",
+                                   f"Remove {len(sel)} proxy/proxies from database?"):
+            return
         for item in sel:
             vals = self.pp_tree.item(item, "values")
             ip, port = vals[0], int(vals[1])
@@ -1429,9 +1458,10 @@ class App:
         if not hasattr(self, "_notebook"):
             return
         try:
-            tab = self._notebook.index(self._notebook.select())
+            self._current_tab = self._notebook.index(self._notebook.select())
             # tab 2 = Proxy Pool (0=Results, 1=Scan Log, 2=Proxy Pool)
-            if tab == 2:
+            if self._current_tab == 2:
+                self._pp_last_save_count = self.sc.db._save_count
                 self._update_pp_tree()
         except Exception:
             pass
@@ -1439,15 +1469,10 @@ class App:
     def _refresh(self):
         self.tree.delete(*self.tree.get_children())
         self._row_num = 0
-        if self.show_all.get():
-            q = self.sc.all_results()
-            if len(q) > MAX_TREE_ITEMS:
-                q = [p for p in self.sc.proxy_results()
-                     if p.get("baidu") or p.get("google")]
-        else:
-            # only show verified proxies (baidu or google)
-            q = [p for p in self.sc.proxy_results()
-                 if p.get("baidu") or p.get("google")]
+        q = [p for p in self.sc.proxy_results()
+             if p.get("baidu") or p.get("google")]
+        if self.show_all.get() and len(q) > MAX_TREE_ITEMS:
+            q = q[:MAX_TREE_ITEMS]
         for r in q:
             self._row_num += 1
             if self._row_num > MAX_TREE_ITEMS:
@@ -1469,6 +1494,13 @@ class App:
         self.status.set(f"Copied {ip}:{port}")
 
     # ---- polling ----
+
+    @staticmethod
+    def _fmt_seconds(secs):
+        secs = int(max(0, secs))
+        h, m = divmod(secs, 3600)
+        m, s = divmod(m, 60)
+        return f"{h:02d}:{m:02d}:{s:02d}"
 
     def _poll(self):
         # --- Results tab: only show verified proxies ---
@@ -1497,14 +1529,26 @@ class App:
                                      tags=(tag,))
             self._log_tree_items = len(log)
 
+        # --- Proxy Pool tab (refresh on DB save) ---
+        if self._current_tab == 2:
+            cnt = self.sc.db._save_count
+            if cnt != self._pp_last_save_count:
+                self._pp_last_save_count = cnt
+                self._update_pp_tree()
+
+        # --- Speed sampling ---
+        self.sc.record_speed()
+
         # --- Progress ---
         s = self.sc.stats
-        self.pbar["value"] = self.sc.progress
+        pct = self.sc.progress
+        self.pbar["value"] = pct
+        self.lbl_pct.config(text=f"{pct:.1f}%" if s["scanned"] else "0%")
         excluded = self.sc._exclude_count
         verified = sum(1 for p in self.sc.proxy_results()
                        if p.get("baidu") or p.get("google"))
         self.lbl_stats.config(
-            text=f"Scanned: {s['scanned']:,}  |  "
+            text=f"Scanned: {s['scanned']:,} / {self.sc.scan_total:,}  |  "
                  f"Found: {s['found']:,}  |  "
                  f"Auth: {s['auth']:,}  |  "
                  f"Verified: {verified:,}  |  "
@@ -1513,11 +1557,12 @@ class App:
 
         if s["start_time"] and s["scanned"]:
             el = time.time() - s["start_time"]
-            el_s = time.strftime("%H:%M:%S", time.gmtime(el))
-            spd = self.sc.speed()
+            el_s = self._fmt_seconds(el)
+            spd = self.sc.recent_speed()
+            if spd <= 0:
+                spd = self.sc.speed()
             remaining = s["total"] - excluded - s["scanned"]
-            rem_s = (time.strftime("%H:%M:%S",
-                                   time.gmtime(max(0, remaining) / spd))
+            rem_s = (self._fmt_seconds(max(0, remaining) / spd)
                      if spd > 0 and remaining > 0 else "--:--:--")
             self.lbl_time.config(
                 text=f"Elapsed: {el_s}  |  Remaining: {rem_s}")
