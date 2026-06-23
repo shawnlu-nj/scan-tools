@@ -9,7 +9,6 @@ auto-verify on discovery, SQLite persistence.
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import threading
-import queue
 import socket
 import ipaddress
 import time
@@ -237,10 +236,6 @@ class ProxyScanner:
         self._max_results = MAX_RESULTS_ALL
         self._verified_new = deque()
 
-        # auto-verify
-        self._verify_queue = queue.Queue()
-        self._verify_workers = []
-        self._verify_running = False
         self.db = ProxyDB()
 
     # ---- target generation ----
@@ -360,7 +355,8 @@ class ProxyScanner:
                         break
                     page += chunk
             elapsed = (time.time() - t0) * 1000
-            ok = len(page) > 200
+            sig = target_host.split(".")[-2].encode()
+            ok = len(page) > 200 and sig in page.lower() and b"<title>" in page.lower()
             return (ok, elapsed)
         except Exception:
             return (False, 0)
@@ -424,13 +420,8 @@ class ProxyScanner:
                     self._proxies.append(rec)
                 if ptype == "auth":
                     self.db.save(rec)
-                # queue for auto-verification (only ok, not auth);
-                # auth proxies don't need further verification
-                if ptype == "ok" and self._verify_running:
-                    try:
-                        self._verify_queue.put_nowait((ip, port, dict(rec)))
-                    except queue.Full:
-                        pass
+                elif ptype == "ok":
+                    self._do_verify((ip, port, dict(rec)), timeout)
 
             with self._all_lock:
                 if len(self._all) >= self._max_results:
@@ -559,21 +550,7 @@ class ProxyScanner:
                 "error": f"Resumed at index {self._next_index:,} / {self._total:,}"
             })
 
-    # ---- auto-verify worker ----
-
-    def _verify_worker(self, timeout):
-        while True:
-            try:
-                task = self._verify_queue.get(timeout=1)
-            except queue.Empty:
-                if not self._verify_running:
-                    break
-                continue
-            if task is None:
-                self._verify_queue.task_done()
-                break
-            self._do_verify(task, timeout)
-            self._verify_queue.task_done()
+    # ---- auto-verify ----
 
     def _do_verify(self, task, timeout):
         """Verify one proxy; exceptions here won't kill the worker."""
@@ -611,35 +588,6 @@ class ProxyScanner:
                     "error": str(exc),
                 })
 
-    def start_verifiers(self, timeout, count=2):
-        self._verify_running = True
-        # Drain any stale sentinels left from previous stop
-        while True:
-            try:
-                self._verify_queue.get_nowait()
-                self._verify_queue.task_done()
-            except queue.Empty:
-                break
-        self._verify_workers = []
-        for _ in range(count):
-            t = threading.Thread(target=self._verify_worker,
-                                 args=(timeout,), daemon=True)
-            t.start()
-            self._verify_workers.append(t)
-
-    def stop_verifiers(self):
-        self._verify_running = False
-        for _ in self._verify_workers:
-            self._verify_queue.put(None)
-        self._verify_workers = []
-        # Drain leftover items (including stale sentinels)
-        while True:
-            try:
-                self._verify_queue.get_nowait()
-                self._verify_queue.task_done()
-            except queue.Empty:
-                break
-
     # ---- public API ----
 
     def start(self, ip_start, ip_end, ports, threads=200, timeout=3,
@@ -675,17 +623,13 @@ class ProxyScanner:
                                  daemon=True)
             t.start()
             self._workers.append(t)
-        # start auto-verifiers
-        self.start_verifiers(timeout, count=min(4, max(1, threads // 10)))
 
     def stop(self):
         self._running = False
-        self.stop_verifiers()
         self._auto_save()
 
     def clear(self):
         self._running = False
-        self.stop_verifiers()
         self._all.clear()
         self._new.clear()
         self._proxies.clear()
@@ -789,11 +733,10 @@ class App:
         self._row_num = 0
 
         # tk vars
-        self.ip_s      = tk.StringVar(value="8.128.0.0")
-        self.ip_e      = tk.StringVar(value="8.191.255.255")
+        self.ip_s      = tk.StringVar(value="")
+        self.ip_e      = tk.StringVar(value="")
         self.cidr      = tk.StringVar()
-        self.ports     = tk.StringVar(
-            value="80,1080,2080,3128,3129,4444,5001,8000,8080,8081,8082,8118,8123,8443,8888,8889,9000,9999,10000,10801")
+        self.ports     = tk.StringVar(value="")
         self.threads   = tk.IntVar(value=200)
         self.timeout   = tk.DoubleVar(value=3.0)
         self.show_all  = tk.BooleanVar(value=False)
@@ -1222,7 +1165,6 @@ class App:
             t = threading.Thread(target=self.sc._worker, args=(to,), daemon=True)
             t.start()
             self.sc._workers.append(t)
-        self.sc.start_verifiers(to, count=min(4, max(1, thr // 10)))
         remaining = self.sc._total - self.sc._exclude_count - self.sc.stats["scanned"]
         self.scan_log_append("RESUME",
             f"Resumed scan, {remaining:,} targets remaining",
@@ -1426,15 +1368,16 @@ class App:
         self.status.set(f"Removed {len(sel)} proxy/proxies")
 
     def _remove_all_proxies(self):
-        proxies = [p for p in self.sc.proxy_results()
-                   if p.get("baidu") or p.get("google") or p.get("auth")]
-        if not proxies:
+        items = self.pp_tree.get_children()
+        if not items:
             return
         if not messagebox.askyesno("Remove All",
-                                   f"Remove all {len(proxies)} proxies?"):
+                                   f"Remove all {len(items)} proxies from database?"):
             return
-        for p in proxies:
-            self.sc.remove_proxy(p["ip"], p["port"])
+        for item in items:
+            vals = self.pp_tree.item(item, "values")
+            ip, port = vals[0], int(vals[1])
+            self.sc.remove_proxy(ip, port)
         self._update_pp_tree()
         self._refresh()
 
